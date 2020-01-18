@@ -68,8 +68,6 @@ impl io::Read for Anyfd {
     };
     if r < 0 {
       Err(io::Error::last_os_error())
-    } else if r == 0 {
-      Err(io::Error::from(io::ErrorKind::WouldBlock))
     } else {
       Ok(r as usize)
     }
