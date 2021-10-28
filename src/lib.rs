@@ -1,13 +1,17 @@
-use std::io;
-use std::os::unix::io::RawFd;
+use std::io::{Result, Error};
+use std::os::unix::io::AsRawFd;
 
-use mio::{Ready, Poll, PollOpt, Token};
-use mio::event::Evented;
-use mio::unix::EventedFd;
-use tokio::io::PollEvented;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
-pub struct Anyfd {
-  fd: RawFd,
+use futures::ready;
+
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::unix::AsyncFd;
+use tokio::io::ReadBuf;
+
+pub struct Anyfd<T: AsRawFd> {
+  afd: AsyncFd<T>,
 }
 
 /// Wrap any suitable file descriptor `fd` as
@@ -20,73 +24,106 @@ pub struct Anyfd {
 /// [`AsyncRead`]: ../tokio/io/trait.AsyncRead.html
 /// [`AsyncWrite`]: ../tokio/io/trait.AsyncWrite.html
 /// [`set_nonblocking`]: fn.set_nonblocking.html
-pub fn anyfd(fd: RawFd) -> io::Result<PollEvented<Anyfd>> {
-  let io = Anyfd { fd };
-  PollEvented::new(io)
+pub fn anyfd<T: AsRawFd>(fd: T) -> Result<Anyfd<T>> {
+  Ok(Anyfd { afd: AsyncFd::new(fd)? })
 }
 
 /// Set `fd` as non-blocking (the [`O_NONBLOCK`] flag).
 ///
 /// [`O_NONBLOCK`]: ../libc/constant.O_NONBLOCK.html
-pub fn set_nonblocking(fd: RawFd) -> io::Result<()> {
+pub fn set_nonblocking(fd: impl AsRawFd) -> Result<()> {
+  let fd = fd.as_raw_fd();
   unsafe {
     let mut flags = libc::fcntl(fd, libc::F_GETFL);
     if flags < 0 {
-      return Err(io::Error::last_os_error());
+      return Err(Error::last_os_error());
     }
     flags |= libc::O_NONBLOCK;
     let r = libc::fcntl(fd, libc::F_SETFL, flags);
     if r < 0 {
-      return Err(io::Error::last_os_error());
+      return Err(Error::last_os_error());
     }
   }
   Ok(())
 }
 
-impl Evented for Anyfd {
-  fn register(&self, poll: &Poll, token: Token, interest: Ready, opts: PollOpt)
-    -> io::Result<()>
-  {
-    EventedFd(&self.fd).register(poll, token, interest, opts)
-  }
+impl<T: AsRawFd> AsyncRead for Anyfd<T> {
+  fn poll_read(
+    self: Pin<&mut Self>,
+    cx: &mut Context<'_>,
+    buf: &mut ReadBuf<'_>
+  ) -> Poll<Result<()>> {
+    let fd = self.afd.as_raw_fd();
+    loop {
+      let mut guard = ready!(self.afd.poll_read_ready(cx))?;
 
-  fn reregister(&self, poll: &Poll, token: Token, interest: Ready, opts: PollOpt)
-    -> io::Result<()>
-  {
-    EventedFd(&self.fd).reregister(poll, token, interest, opts)
-  }
-
-  fn deregister(&self, poll: &Poll) -> io::Result<()> {
-    EventedFd(&self.fd).deregister(poll)
-  }
-}
-
-impl io::Read for Anyfd {
-  fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-    let r = unsafe {
-      libc::read(self.fd, buf.as_mut_ptr() as *mut _, buf.len())
-    };
-    if r < 0 {
-      Err(io::Error::last_os_error())
-    } else {
-      Ok(r as usize)
+      match guard.try_io(|_| {
+        let r = unsafe {
+          let unfilled = buf.unfilled_mut();
+          libc::read(fd, unfilled.as_ptr() as *mut _, unfilled.len())
+        };
+        if r < 0 {
+          let err = Error::last_os_error();
+          Err(err)
+        } else {
+          unsafe { buf.assume_init(r as usize) };
+          buf.advance(r as usize);
+          Ok(())
+        }
+      }) {
+        Ok(result) => return Poll::Ready(result),
+        Err(_would_block) => continue,
+      }
     }
   }
 }
 
-impl io::Write for Anyfd {
-  fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-    let r = unsafe {
-      libc::write(self.fd, buf.as_ptr() as *const _, buf.len())
-    };
-    if r < 0 {
-      Err(io::Error::last_os_error())
-    } else {
-      Ok(r as usize)
+impl<T: AsRawFd> AsyncWrite for Anyfd<T> {
+  fn poll_write(
+    self: Pin<&mut Self>,
+    cx: &mut Context<'_>,
+    buf: &[u8]
+  ) -> Poll<Result<usize>> {
+    let fd = self.afd.as_raw_fd();
+    loop {
+      let mut guard = ready!(self.afd.poll_write_ready(cx))?;
+
+      match guard.try_io(|_| {
+        let r = unsafe {
+          libc::write(fd, buf.as_ptr() as *const _, buf.len())
+        };
+        if r < 0 {
+          let err = Error::last_os_error();
+          Err(err)
+        } else {
+          Ok(r as usize)
+        }
+      }) {
+        Ok(result) => return Poll::Ready(result),
+        Err(_would_block) => continue,
+      }
     }
   }
 
-  fn flush(&mut self) -> io::Result<()> {
-    Ok(())
+  fn poll_flush(
+    self: Pin<&mut Self>,
+    _cx: &mut Context<'_>,
+  ) -> Poll<Result<()>> {
+    Poll::Ready(Ok(()))
+  }
+
+  fn poll_shutdown(
+    self: Pin<&mut Self>,
+    _cx: &mut Context<'_>,
+  ) -> Poll<Result<()>> {
+    let fd = self.afd.as_raw_fd();
+    let r = unsafe {
+      libc::shutdown(fd, libc::SHUT_WR)
+    };
+    if r == 0 {
+      Poll::Ready(Ok(()))
+    } else {
+      Poll::Ready(Err(Error::last_os_error()))
+    }
   }
 }
