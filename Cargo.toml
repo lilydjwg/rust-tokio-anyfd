@@ -1,14 +1,13 @@
 [package]
 name = "tokio-anyfd"
-version = "0.2.0"
-authors = ["lilydjwg <lilydjwg@gmail.com>"]
+version = "0.2.1"
 license = "BSD-3-Clause"
 keywords = ["tokio", "fd", "unix"]
 description = "Use any suitable file descriptor with tokio"
 documentation = "https://docs.rs/tokio-anyfd"
 homepage = "https://github.com/lilydjwg/rust-tokio-anyfd"
 repository = "https://github.com/lilydjwg/rust-tokio-anyfd"
-edition = "2018"
+edition = "2021"
 
 [dependencies]
 libc = "0.2"
